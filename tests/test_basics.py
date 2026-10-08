@@ -182,3 +182,30 @@ def test_iam_url_derived_from_base_url_before_jwt():
     assert cfg.tenant == "rw_demo" and cfg.base_url == "https://ast.checkmarx.net"
     A.t1_iam_url = "https://custom.iam.example"
     assert resolve_tenant("T1", A, EnvSources(environ={})).iam_url == "https://custom.iam.example"
+
+
+def test_jwt_validation():
+    import time as _t
+    from tests.fakes import make_jwt as mj
+
+    class A:
+        t1_base_url = "https://ast.checkmarx.net"
+        t1_iam_url = t1_tenant = t1_api_key = None
+    A.t1_api_key = mj("rw_demo", "deu.iam.checkmarx.net", "deu.ast.checkmarx.net")
+    A.t1_tenant = "someone_else"
+    with pytest.raises(FatalError) as e:                       # key belongs to another tenant
+        resolve_tenant("T1", A, EnvSources(environ={}))
+    assert "does not match" in str(e.value)
+    A.t1_tenant = "RW_Demo"                                    # case-insensitive match; region differs -> warnings
+    cfg = resolve_tenant("T1", A, EnvSources(environ={}))
+    assert any("issuer" in w for w in cfg.warnings) and any("base URL host" in w for w in cfg.warnings)
+    A.t1_base_url = "https://deu.ast.checkmarx.net"            # consistent -> clean
+    assert resolve_tenant("T1", A, EnvSources(environ={})).warnings == []
+    import base64, json
+
+    def b64(d):
+        return base64.urlsafe_b64encode(json.dumps(d).encode()).rstrip(b"=").decode()
+    A.t1_api_key = f"{b64({'a': 1})}.{b64({'iss': 'https://x/auth/realms/rw_demo', 'exp': int(_t.time()) - 5})}.s"
+    with pytest.raises(FatalError) as e:
+        resolve_tenant("T1", A, EnvSources(environ={}))
+    assert "expired" in str(e.value)

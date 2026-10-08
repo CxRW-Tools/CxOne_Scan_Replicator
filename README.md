@@ -50,6 +50,7 @@ python main.py --source-env-file C:\envs\.env.rw_demo --target-env-file C:\envs\
 * Only the API key is required. Anything omitted is derived: tenant and base URL from the key's JWT, and the
   IAM URL from the base URL (`ast.` → `iam.`, as in the CxOne template), falling back to the JWT issuer. Set
   `CXONE_IAM_URL` only if that guess is wrong. (`--t1-*`/`--t2-*` remain as aliases of `--source-*`/`--target-*`.)
+* The configured values are cross-checked against the API key's JWT: a tenant that differs from the key's is **fatal**, an expired key is fatal, and an IAM/base-URL host that differs from the key's issuer region is a **warning**.
 * Non-credential settings (`REPLICATOR_SCAN_TYPES`, `REPLICATOR_OUTPUT_DIR`, ...) go in an optional
   `--env-file` (repeatable; later files win; `./.env` is loaded only if no `--env-file` is given), or on the CLI.
   Legacy `CXONE_T1_*` / `CXONE_T2_*` variables in that file/environment still work at lower priority.

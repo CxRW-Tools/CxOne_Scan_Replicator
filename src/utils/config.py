@@ -9,6 +9,7 @@ import base64
 import json
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
 from urllib.parse import urlparse
@@ -141,6 +142,7 @@ class TenantConfig:
     tenant: str = ""
     api_key: str = field(default="", repr=False)
     sources: dict = field(default_factory=dict)
+    warnings: list = field(default_factory=list)
 
     @property
     def role(self) -> str:
@@ -205,7 +207,41 @@ def resolve_tenant(label: str, args, env: EnvSources, tenant_env: Optional[EnvSo
     for f in ("base_url", "iam_url"):
         if not re.match(r"^https?://", getattr(cfg, f)):
             setattr(cfg, f, "https://" + getattr(cfg, f))
+    validate_against_jwt(cfg, claims)
     return cfg
+
+
+def _host(url: str) -> str:
+    return (urlparse(url if "//" in url else "https://" + url).hostname or "").lower()
+
+
+def validate_against_jwt(cfg: TenantConfig, claims: dict):
+    """Cross-check configured values against the API key's JWT claims.
+
+    A key issued for a different tenant is fatal (it cannot authenticate to the configured realm);
+    a region/host mismatch is reported as a warning because the key may still work.
+    """
+    role = cfg.role
+    exp = claims.get("exp")
+    if isinstance(exp, (int, float)) and 0 < exp < time.time():
+        raise FatalError(f"{role} tenant: the API key in the env file has expired "
+                         f"(exp {time.strftime('%Y-%m-%d', time.gmtime(exp))})")
+    iss = claims.get("iss") or ""
+    if not iss:
+        return
+    jwt_tenant = iss.rstrip("/").rsplit("/", 1)[-1]
+    if cfg.sources.get("tenant") != "jwt" and jwt_tenant and cfg.tenant.lower() != jwt_tenant.lower():
+        raise FatalError(f"{role} tenant: configured tenant '{cfg.tenant}' does not match the API key's "
+                         f"tenant '{jwt_tenant}'; wrong key or wrong CXONE_TENANT in the {role} env file")
+    jwt_iam = _host(iss)
+    if jwt_iam and _host(cfg.iam_url) != jwt_iam:
+        cfg.warnings.append(f"{role} tenant: IAM host {_host(cfg.iam_url)} (from "
+                            f"{cfg.sources.get('iam_url')}) differs from the API key's issuer {jwt_iam}; "
+                            f"the key may belong to another region")
+    jwt_base = _host(claims.get("ast-base-url") or "")
+    if jwt_base and _host(cfg.base_url) != jwt_base:
+        cfg.warnings.append(f"{role} tenant: base URL host {_host(cfg.base_url)} (from "
+                            f"{cfg.sources.get('base_url')}) differs from the API key's {jwt_base}")
 
 
 def same_tenant(a: TenantConfig, b: TenantConfig) -> bool:

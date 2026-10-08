@@ -222,6 +222,9 @@ def _run(argv, session_factory, sleep) -> int:
     for cfg in (t1_cfg, t2_cfg):
         if cfg:
             _say(args, "  " + cfg.describe())
+            for w in cfg.warnings:
+                print(f"WARNING: {w}", file=sys.stderr)
+                logger.warning(w)
     for n in notices:
         _say(args, "NOTICE: " + n)
     warnings = st.warnings_for(scan_types) if mode.uses_t2 else []
