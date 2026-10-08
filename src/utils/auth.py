@@ -1,77 +1,67 @@
-import sys
+"""Thread-safe AuthManager (API key -> access token via refresh_token grant)."""
+from __future__ import annotations
+
+import threading
 import time
+from typing import Optional
+
 import requests
 
+from src.model import USER_AGENT
+
+
+class AuthError(Exception):
+    pass
+
+
 class AuthManager:
-    def __init__(self, base_url, tenant_name, api_key, debug=False):
-        """Initialize the authentication manager.
-        
-        Args:
-            base_url (str): The base URL for the CxOne instance
-            tenant_name (str): The tenant name
-            api_key (str): The API key for authentication
-            debug (bool, optional): Enable debug output. Defaults to False.
-        """
-        self.base_url = base_url
+    def __init__(self, iam_url: str, tenant_name: str, api_key: str, debug: bool = False,
+                 http=None):
         self.tenant_name = tenant_name
         self.api_key = api_key
         self.debug = debug
-        self.auth_token = None
-        self.token_expiration = 0
-        self.iam_base_url = self._generate_iam_url()
-        self.auth_url = self._generate_auth_url()
+        self.auth_url = f"{iam_url.rstrip('/')}/auth/realms/{tenant_name}/protocol/openid-connect/token"
+        self._http = http or requests
+        self._lock = threading.Lock()
+        self._token: Optional[str] = None
+        self._expires_at = 0.0
 
-    def _generate_iam_url(self):
-        """Generate the IAM URL from the base URL."""
-        return self.base_url.replace("ast.checkmarx.net", "iam.checkmarx.net")
+    def _valid(self) -> bool:
+        return self._token is not None and time.time() < self._expires_at - 60
 
-    def _generate_auth_url(self):
-        """Generate the authentication URL."""
-        return f"{self.iam_base_url}/auth/realms/{self.tenant_name}/protocol/openid-connect/token"
+    def ensure_authenticated(self) -> str:
+        if self._valid():
+            return self._token
+        with self._lock:
+            if not self._valid():
+                self._authenticate()
+            return self._token
 
-    def ensure_authenticated(self):
-        """Ensure we have a valid authentication token."""
-        if time.time() >= self.token_expiration - 60:
-            self._authenticate()
-        return self.auth_token
+    def invalidate(self, bad_token: Optional[str] = None):
+        """Drop the cached token (only if it is still the one that failed)."""
+        with self._lock:
+            if bad_token is None or bad_token == self._token:
+                self._token = None
+                self._expires_at = 0.0
 
     def _authenticate(self):
-        """Authenticate with the API key and get a new token."""
-        if self.debug:
-            print("Authenticating with API key...")
-            
-        headers = {'Content-Type': 'application/x-www-form-urlencoded'}
-        data = {
-            'grant_type': 'refresh_token',
-            'client_id': 'ast-app',
-            'refresh_token': self.api_key
-        }
-        
+        data = {"grant_type": "refresh_token", "client_id": "ast-app", "refresh_token": self.api_key}
         try:
-            response = requests.post(self.auth_url, headers=headers, data=data)
-            response.raise_for_status()
-            
-            json_response = response.json()
-            self.auth_token = json_response.get('access_token')
-            if not self.auth_token:
-                raise ValueError("No access token in response")
-                
-            expires_in = json_response.get('expires_in', 600)
-            self.token_expiration = time.time() + expires_in
+            r = self._http.post(self.auth_url, data=data, timeout=(10, 60),
+                                headers={"Content-Type": "application/x-www-form-urlencoded",
+                                         "User-Agent": USER_AGENT})
+        except requests.RequestException as e:
+            raise AuthError(f"authentication request failed for tenant '{self.tenant_name}': "
+                            f"{type(e).__name__}")
+        if r.status_code != 200:
+            raise AuthError(f"authentication failed for tenant '{self.tenant_name}': HTTP {r.status_code}")
+        try:
+            body = r.json()
+            token = body["access_token"]
+        except Exception:
+            raise AuthError(f"authentication response for '{self.tenant_name}' had no access_token")
+        self._token = token
+        self._expires_at = time.time() + float(body.get("expires_in", 600))
 
-            if self.debug:
-                print("Authentication successful")
-                
-        except requests.exceptions.RequestException as e:
-            print(f"Authentication error: {e}")
-            sys.exit(1)
-        except ValueError as e:
-            print(f"Authentication error: {e}")
-            sys.exit(1)
-
-    def get_headers(self):
-        """Get headers with authentication token for API requests."""
-        return {
-            'Authorization': f'Bearer {self.ensure_authenticated()}',
-            'Content-Type': 'application/json'
-        } 
+    def get_headers(self) -> dict:
+        return {"Authorization": f"Bearer {self.ensure_authenticated()}"}
