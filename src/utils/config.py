@@ -142,9 +142,13 @@ class TenantConfig:
     api_key: str = field(default="", repr=False)
     sources: dict = field(default_factory=dict)
 
+    @property
+    def role(self) -> str:
+        return "source" if self.label == "T1" else "target"
+
     def describe(self) -> str:
         s = self.sources
-        return (f"{self.label}: tenant={self.tenant} [{s.get('tenant')}]  "
+        return (f"{self.role.capitalize()}: tenant={self.tenant} [{s.get('tenant')}]  "
                 f"base_url={self.base_url} [{s.get('base_url')}]  "
                 f"iam_url={self.iam_url} [{s.get('iam_url')}]  api_key=*** [{s.get('api_key')}]")
 
@@ -172,26 +176,30 @@ def resolve_tenant(label: str, args, env: EnvSources, tenant_env: Optional[EnvSo
         setattr(cfg, f, v or "")
         cfg.sources[f] = src
     if not cfg.api_key:
-        raise FatalError(f"{label} ({role}): API key is required (--{role}-env-file with CXONE_API_KEY, "
-                         f"or --{n}-api-key)")
+        raise FatalError(f"{role} tenant: API key is required (--{role}-env-file with CXONE_API_KEY, "
+                         f"or --{role}-api-key)")
     claims = decode_jwt_payload(cfg.api_key)
     iss = claims.get("iss") or ""
     if not cfg.tenant and iss:
         cfg.tenant, cfg.sources["tenant"] = iss.rstrip("/").rsplit("/", 1)[-1], "jwt"
     if not cfg.base_url and claims.get("ast-base-url"):
         cfg.base_url, cfg.sources["base_url"] = claims["ast-base-url"], "jwt"
-    if not cfg.iam_url and iss:
-        u = urlparse(iss)
-        if u.scheme and u.netloc:
-            cfg.iam_url, cfg.sources["iam_url"] = f"{u.scheme}://{u.netloc}", "jwt"
+    # IAM URL: explicit > derived from the base URL (ast.* -> iam.*, as in the CxOne template) > JWT issuer.
+    # The base URL wins over the JWT because an API key's issuer region can differ from where the
+    # tenant is actually served.
     if not cfg.iam_url and cfg.base_url:
         derived = _iam_from_base(cfg.base_url)
         if derived:
             cfg.iam_url, cfg.sources["iam_url"] = derived, "derived-from-base-url"
+    if not cfg.iam_url and iss:
+        u = urlparse(iss)
+        if u.scheme and u.netloc:
+            cfg.iam_url, cfg.sources["iam_url"] = f"{u.scheme}://{u.netloc}", "jwt"
     missing = [f for f in ("base_url", "iam_url", "tenant") if not getattr(cfg, f)]
     if missing:
-        raise FatalError(f"{label}: could not determine {', '.join(missing)} "
-                         f"(set --{n}-<name> or CXONE_{label}_<NAME>; the API key's JWT didn't supply it)")
+        raise FatalError(f"{role} tenant: could not determine {', '.join(missing)} "
+                         f"(set CXONE_<NAME> in --{role}-env-file or --{role}-<name>; "
+                         f"the API key's JWT didn't supply it)")
     cfg.base_url = cfg.base_url.rstrip("/")
     cfg.iam_url = cfg.iam_url.rstrip("/")
     for f in ("base_url", "iam_url"):

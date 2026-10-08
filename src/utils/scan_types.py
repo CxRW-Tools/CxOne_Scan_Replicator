@@ -47,6 +47,19 @@ def parse_scan_types(raw: Optional[str]) -> list:
     return [t for t in CANONICAL if t in wanted]
 
 
+def from_source_engines(engines) -> list:
+    """Map an original scan's `engines` to the supported selection (canonical order).
+
+    Engines this tool never runs (containers, microengines/secrets, aisc, ...) are dropped.
+    """
+    wanted = set()
+    for e in engines or []:
+        v = ALIASES.get(str(e).strip().lower(), str(e).strip().lower())
+        if v in CANONICAL:
+            wanted.add(v)
+    return [t for t in CANONICAL if t in wanted]
+
+
 def build_config(types: list, sast_value: Optional[dict] = None) -> tuple:
     """Immutable-ish `config` array: exactly the selected engines, each with value {}."""
     if not types:

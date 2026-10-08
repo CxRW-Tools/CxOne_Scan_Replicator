@@ -241,7 +241,7 @@ class StatusUI:
             if state == "PAUSED":
                 state += f" (resume check in {fmt_dur(q['resume_at'] - time.time())})"
             parts.append(Panel(f"Queued {q['queued']}  Running {q['running']}  "
-                               f"threshold {q['threshold']}  state: {state}", title="Tenant2 queue"))
+                               f"threshold {q['threshold']}  state: {state}", title="Target tenant queue"))
         if s.errors:
             t = Table(title="Recent errors")
             for col in ("scan", "code", "message"):

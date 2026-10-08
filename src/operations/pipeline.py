@@ -1,4 +1,4 @@
-"""Staged worker pipeline (mode-aware) + Tenant2 queue gate + per-project start ordering."""
+"""Staged worker pipeline (mode-aware) + Target tenant queue gate + per-project start ordering."""
 from __future__ import annotations
 
 import csv
@@ -104,7 +104,7 @@ class Sequencer:
 
 
 class QueueGate:
-    """After every N starts, pause new uploads/starts while Tenant2's queue is over the threshold."""
+    """After every N starts, pause new uploads/starts while Target tenant's queue is over the threshold."""
 
     def __init__(self, ctx):
         self.ctx = ctx
@@ -141,7 +141,7 @@ class QueueGate:
                     ctx.stats.set_queue(queued=depth, threshold=a.queue_max, state="OK")
                     if paused:
                         ctx.audit.event("queue_resume", depth=depth)
-                        ctx.logger.info("Tenant2 queue back under threshold (%s); resuming", depth)
+                        ctx.logger.info("Target tenant queue back under threshold (%s); resuming", depth)
                     self.open.set()
                     return
                 if not paused:
@@ -149,7 +149,7 @@ class QueueGate:
                     self.open.clear()
                     ctx.audit.event("queue_pause", depth=depth, threshold=a.queue_max,
                                     pause_seconds=a.queue_pause_seconds)
-                    ctx.logger.warning("Tenant2 queue %s > %s: pausing %ss", depth, a.queue_max,
+                    ctx.logger.warning("Target tenant queue %s > %s: pausing %ss", depth, a.queue_max,
                                        a.queue_pause_seconds)
                 resume_at = time.time() + a.queue_pause_seconds
                 ctx.stats.set_queue(queued=depth, threshold=a.queue_max, state="PAUSED",
@@ -476,7 +476,7 @@ class Pipeline:
     def _tags(self, job: ScanJob) -> dict:
         tags = dict(job.tags)
         tags.update({TAG_FROM_SCAN: job.source_scan_id, TAG_FROM_TENANT: job.t1_tenant,
-                     TAG_FROM_PROJECT: job.t1_project_id, TAG_TYPES: st.tag_value(self.ctx.scan_types),
+                     TAG_FROM_PROJECT: job.t1_project_id, TAG_TYPES: st.tag_value(job.scan_types),
                      TAG_AT: utc_now()})
         return tags
 
@@ -488,7 +488,8 @@ class Pipeline:
         if self.halt.is_set():
             raise JobBail()
         ctx.stats.set_stage(job, "starting")
-        job.scan_types = list(ctx.scan_types)
+        if not ctx.inherit_types:
+            job.scan_types = list(ctx.scan_types)
         ctx.set_status(job, S.STARTING, "start")
         tags = self._tags(job)
         t0 = time.time()
@@ -503,19 +504,19 @@ class Pipeline:
             scan_id = self._resolve_ambiguous(job, tags, e)
         job.t2_scan_id = scan_id
         ctx.audit.event("scan_started", source_scan_id=job.source_scan_id, project_name=job.project_name,
-                        branch=job.branch, scan_types=list(ctx.scan_types), t2_project_id=job.t2_project_id,
+                        branch=job.branch, scan_types=list(job.scan_types), t2_project_id=job.t2_project_id,
                         t2_scan_id=scan_id, duration_ms=int((time.time() - t0) * 1000))
         self.finalize(job, S.STARTED)
         self._after_start(job)
 
     def _rejected(self, job, e: ScanStartRejected):
         ctx = self.ctx
-        if e.status == 400 and "api" in ctx.scan_types and e.mentions_apisec:
+        if e.status == 400 and "api" in job.scan_types and e.mentions_apisec:
             self.halt.set()
-            self.result.halted = ("Tenant2 rejected the 'apisec' engine (HTTP 400). Every scan would fail; "
+            self.result.halted = ("Target tenant rejected the 'apisec' engine (HTTP 400). Every scan would fail; "
                                   "stopped starting scans. Re-run without 'api' in --scan-types.")
             ctx.audit.event("scan_type_rejected", engine="apisec", status=e.status, message=e.body[:300])
-            raise JobFailure(E.SCAN_TYPE_REJECTED, "Tenant2 rejected engine apisec")
+            raise JobFailure(E.SCAN_TYPE_REJECTED, "Target tenant rejected engine apisec")
         raise JobFailure(E.START_FAILED, str(e))
 
     def _resolve_ambiguous(self, job, tags, first: Exception) -> str:
@@ -569,12 +570,12 @@ class Pipeline:
 
     def _verify(self, jobs):
         ctx = self.ctx
-        want = sorted(st.api_names(ctx.scan_types))
         try:
             got = ctx.t2.scan_engines([j.t2_scan_id for j in jobs])
         except requests.RequestException:
             return
         for j in jobs:
+            want = sorted(st.api_names(j.scan_types))
             engines = sorted(set(got.get(j.t2_scan_id, [])))
             if engines and engines != want:
                 ctx.logger.warning("engine mismatch on %s: wanted %s got %s", j.t2_scan_id, want, engines)
@@ -594,7 +595,7 @@ def write_report(ctx, jobs: list):
         w.writerow(REPORT_COLUMNS)
         for j in jobs:
             w.writerow([j.source_scan_id, j.project_name, j.branch,
-                        ",".join(ctx.scan_types) if ctx.mode.uses_t2 else "", j.status, j.error_code,
+                        ",".join(j.scan_types) if ctx.mode.uses_t2 else "", j.status, j.error_code,
                         "" if j.zip_bytes is None else j.zip_bytes, j.zip_sha256, j.zip_path,
                         j.t2_project_id, "" if j.t2_project_created is None else str(j.t2_project_created).lower(),
                         j.t2_scan_id, j.attempts])
@@ -604,7 +605,8 @@ def format_summary(ctx, result: RunResult, jobs: list) -> str:
     counts = Counter(j.status for j in jobs)
     L = ["", "=" * 70, f"Run {ctx.run_id} - mode: {ctx.mode.value}"]
     if ctx.mode.uses_t2:
-        L.append(f"Scan types: {st.labels(ctx.scan_types)}")
+        L.append("Scan types: " + ("per scan (original engines)" if ctx.inherit_types
+                                   else st.labels(ctx.scan_types)))
     L.append(f"Total: {len(jobs)}")
     for k, v in sorted(counts.items()):
         L.append(f"  {k:<18}{v}")

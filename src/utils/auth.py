@@ -54,7 +54,8 @@ class AuthManager:
             raise AuthError(f"authentication request failed for tenant '{self.tenant_name}': "
                             f"{type(e).__name__}")
         if r.status_code != 200:
-            raise AuthError(f"authentication failed for tenant '{self.tenant_name}': HTTP {r.status_code}")
+            raise AuthError(f"authentication failed for tenant '{self.tenant_name}': HTTP {r.status_code} "
+                            f"from {self.auth_url.split('/auth/')[0]} (check the base URL / IAM URL)")
         try:
             body = r.json()
             token = body["access_token"]

@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 
 from src.model import E, FatalError, JobFailure, Mode, S, ScanJob
 from src.operations import tenant1
+from src.utils import scan_types as st
 from src.utils.manifest import read_manifest, safe_join, zip_relpath
 
 OK_STATUSES = {"completed", "partial"}
@@ -47,7 +48,7 @@ def jobs_from_tenant1(ctx, ids: list) -> list:
         j.t1_tenant, j.t1_base_url = ctx.t1_cfg.tenant, ctx.t1_cfg.base_url
         m = meta.get(sid)
         if m is None:
-            _fail(ctx, j, E.SOURCE_SCAN_NOT_FOUND, "scan id not returned by Tenant1")
+            _fail(ctx, j, E.SOURCE_SCAN_NOT_FOUND, "scan id not returned by Source tenant")
         else:
             j.t1_project_id = str(m.get("projectId") or "")
             j.project_name = m.get("projectName") or ""
@@ -61,7 +62,7 @@ def jobs_from_tenant1(ctx, ids: list) -> list:
                 ctx.logger.warning("scan %s has status %r (not Completed/Partial); source may still exist",
                                    sid, j.source_status)
             if not j.project_name:
-                _fail(ctx, j, E.SOURCE_SCAN_NOT_FOUND, "Tenant1 scan has no project name")
+                _fail(ctx, j, E.SOURCE_SCAN_NOT_FOUND, "Source tenant scan has no project name")
         jobs.append(j)
     return jobs
 
@@ -96,6 +97,20 @@ def jobs_from_manifest(ctx, ids) -> list:
     return jobs
 
 
+def assign_inherited_types(ctx, jobs: list):
+    """No --scan-types: each job runs the supported subset of its original scan's engines."""
+    for j in jobs:
+        if j.status == S.FAILED:
+            continue
+        j.scan_types = st.from_source_engines(j.source_engines)
+        if not j.scan_types:
+            _fail(ctx, j, E.NO_SUPPORTED_ENGINES,
+                  f"original scan engines {j.source_engines} include none of sast/iac/api/sca")
+            continue
+        for w in st.warnings_for(j.scan_types):
+            ctx.logger.warning("scan %s: %s", j.source_scan_id, w)
+
+
 # --------------------------------------------------------------------------- de-dup + resume
 def apply_dedupe_and_state(ctx, jobs: list, plan: Plan):
     a = ctx.args
@@ -119,11 +134,11 @@ def apply_dedupe_and_state(ctx, jobs: list, plan: Plan):
                 j.zip_bytes = row["zip_bytes"]
             if row.get("zip_path") and not j.zip_path:
                 j.zip_path = row["zip_path"]
-        # 1) already replicated according to Tenant2 tags
+        # 1) already replicated according to Target tenant tags
         hit = dedupe.get((j.t1_tenant, j.source_scan_id))
         if hit:
             j.status, j.t2_scan_id = S.SKIPPED_DUPLICATE, hit[0]
-            j.dup_info = f"tag: existing Tenant2 scan {hit[0]} (scan types: {hit[1] or 'unknown'})"
+            j.dup_info = f"tag: existing Target tenant scan {hit[0]} (scan types: {hit[1] or 'unknown'})"
             ctx.audit.event("dedupe_hit", source_scan_id=j.source_scan_id, via="tags",
                             t2_scan_id=hit[0], existing_scan_types=hit[1])
             continue
@@ -131,7 +146,7 @@ def apply_dedupe_and_state(ctx, jobs: list, plan: Plan):
             st = row["status"]
             if ctx.mode.uses_t2 and st == S.STARTED:
                 j.status, j.t2_scan_id = S.SKIPPED_DUPLICATE, row.get("t2_scan_id") or ""
-                j.dup_info = f"state-db: already started as Tenant2 scan {j.t2_scan_id}"
+                j.dup_info = f"state-db: already started as Target tenant scan {j.t2_scan_id}"
                 ctx.audit.event("dedupe_hit", source_scan_id=j.source_scan_id, via="state_db",
                                 t2_scan_id=j.t2_scan_id)
                 continue
@@ -149,11 +164,11 @@ def apply_dedupe_and_state(ctx, jobs: list, plan: Plan):
                 ctx.save(j)
                 continue
         if row and ctx.mode.uses_t2 and row["status"] != S.STARTED and row.get("scan_types") \
-                and row["scan_types"] != ",".join(ctx.scan_types):
+                and row["scan_types"] != ",".join(j.scan_types):
             ctx.logger.info("scan %s: resuming with scan types %s (was %s)", j.source_scan_id,
-                            ",".join(ctx.scan_types), row["scan_types"])
+                            ",".join(j.scan_types), row["scan_types"])
             ctx.audit.event("preflight", step="scan_types_changed", source_scan_id=j.source_scan_id,
-                            old=row["scan_types"], new=ctx.scan_types)
+                            old=row["scan_types"], new=j.scan_types)
         j.status = S.PENDING            # reset any in-progress state left by a crash
         j.error_code = j.error_message = ""
         plan.to_run.append(j)
@@ -189,6 +204,8 @@ def build_plan(ctx, ids: list, subset_ids=None) -> Plan:
     else:
         jobs = jobs_from_tenant1(ctx, ids)
     plan.jobs = jobs
+    if ctx.inherit_types:
+        assign_inherited_types(ctx, jobs)
     ctx.audit.event("preflight", step="jobs_built", total=len(jobs),
                     not_found=sum(1 for j in jobs if j.status == S.FAILED))
     apply_dedupe_and_state(ctx, jobs, plan)
@@ -206,7 +223,7 @@ def build_plan(ctx, ids: list, subset_ids=None) -> Plan:
 
 # --------------------------------------------------------------------------- dry run
 def dry_run_checks(ctx, plan: Plan):
-    """Network-only checks: source HEADs (T1 modes), project lookups (T2 modes), manifest zips."""
+    """Network-only checks: source HEADs (source modes), project lookups (target modes), manifest zips."""
     a = ctx.args
     if ctx.mode.uses_t1:
         def head(j):
@@ -266,10 +283,19 @@ def format_plan(ctx, plan: Plan) -> str:
     L = []
     L.append(f"Plan ({'dry run' if ctx.dry_run else 'confirmation'}) - mode: {ctx.mode.value}")
     if ctx.mode.uses_t2:
-        L.append(f"  Scan types: {st.labels(ctx.scan_types)}  ({','.join(ctx.scan_types)})")
-        L.append("  config sent for every scan: " + json.dumps(st.config_payload(ctx.config)))
-        for w in st.warnings_for(ctx.scan_types):
-            L.append(f"  WARNING: {w}")
+        if ctx.inherit_types:
+            combos = {}
+            for j in plan.jobs:
+                if j.scan_types and j.status != S.FAILED:
+                    combos[",".join(j.scan_types)] = combos.get(",".join(j.scan_types), 0) + 1
+            L.append("  Scan types: per scan, from the original scan's engines (no --scan-types given)")
+            for c, n in sorted(combos.items(), key=lambda kv: -kv[1]):
+                L.append(f"      {c}: {n} scan(s)")
+        else:
+            L.append(f"  Scan types: {st.labels(ctx.scan_types)}  ({','.join(ctx.scan_types)})")
+            L.append("  config sent for every scan: " + json.dumps(st.config_payload(ctx.config)))
+            for w in st.warnings_for(ctx.scan_types):
+                L.append(f"  WARNING: {w}")
     L.append(f"  Total input: {len(plan.jobs)}")
     verb = {"replicate": "to start", "download-only": "to download", "from-manifest": "to start"}[ctx.mode.value]
     L.append(f"  {len(plan.to_run)} {verb}")
@@ -288,7 +314,7 @@ def format_plan(ctx, plan: Plan) -> str:
     if ctx.mode == Mode.DOWNLOAD_ONLY and ctx.dry_run:
         L.append(f"  already downloaded (file present, size matches): {plan.already_downloaded}")
     if ctx.mode.uses_t2 and ctx.dry_run:
-        L.append(f"  {len(plan.create_names)} Tenant2 projects to create, "
+        L.append(f"  {len(plan.create_names)} Target tenant projects to create, "
                  f"{plan.existing_projects} already exist")
         for n in plan.create_names[:25]:
             L.append(f"      + {n}")

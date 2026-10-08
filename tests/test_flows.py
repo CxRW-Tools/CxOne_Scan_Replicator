@@ -53,12 +53,41 @@ def test_report_and_logs_have_no_secrets(runner, world, tmp_path):
     assert rows[0]["status"] == "STARTED" and rows[0]["scan_types"] == "sast" and rows[0]["t2_scan_id"]
 
 
-def test_scan_types_required_before_any_http(runner, world):
+def test_bad_scan_types_fail_before_any_http(runner, world):
     a = world.add_scan()
-    assert runner.run("--scan-ids", a, "--yes") == 1
-    assert world.requests == []
+    assert runner.run("--scan-ids", a, "--scan-types", ",", "--yes") == 1
     assert runner.run("--scan-ids", a, "--scan-types", "sast,containers", "--yes") == 1
     assert world.requests == []
+
+
+def test_scan_types_omitted_uses_original_engines(runner, world, tmp_path):
+    a = world.add_scan("p1", engines=("sast", "kics", "containers", "microengines"))
+    b = world.add_scan("p2", engines=("sca", "sast", "apisec"))
+    c = world.add_scan("p3", engines=("containers", "microengines"))      # nothing supported
+    rc = runner.run("--scan-ids", f"{a},{b},{c}", "--yes")
+    assert rc == 2
+    got = {x["tags"]["cx-replicated-from-scan"]: ([e["type"] for e in x["config"]], x["tags"]["cx-replicated-scan-types"])
+           for x in world.scan_bodies}
+    assert got[a] == (["sast", "kics"], "sast,iac")
+    assert got[b] == (["sast", "apisec", "sca"], "sast,api,sca")
+    assert c not in got
+    rep = read_csv(sorted((tmp_path / "logs").glob("*replicate*.csv"))[-1])
+    row = {r["source_scan_id"]: r for r in rep}
+    assert row[a]["scan_types"] == "sast,iac" and row[c]["error_code"] == "no_supported_engines"
+
+
+def test_explicit_scan_types_override_original(runner, world):
+    a = world.add_scan(engines=("sast", "kics"))
+    assert runner.run("--scan-ids", a, "--scan-types", "sca", "--yes") == 0
+    assert [e["type"] for e in world.scan_bodies[0]["config"]] == ["sca"]
+
+
+def test_from_manifest_omitted_scan_types_uses_manifest_engines(runner, world, tmp_path):
+    a = world.add_scan(engines=("sast", "sca"))
+    out = tmp_path / "out"
+    runner.run("--download-only", "--output-dir", str(out), "--scan-ids", a)
+    assert runner.run("--from-manifest", str(out), "--yes") == 0
+    assert [e["type"] for e in world.scan_bodies[0]["config"]] == ["sast", "sca"]
 
 
 def test_scan_types_from_env_file_and_cli_precedence(runner, world, tmp_path):
@@ -339,7 +368,7 @@ def test_from_manifest_chain(runner, world, tmp_path):
     assert len(world.t2_scans) == 4
     assert all([c["type"] for c in b["config"]] == ["kics", "sca"] for b in world.scan_bodies)
     assert len(list(out.glob("*.zip"))) == 4          # never deleted
-    assert runner.run("--from-manifest", str(out), "--yes") == 1      # scan types required
+    assert runner.run("--from-manifest", str(out), "--scan-types", "nope", "--yes") == 1
 
 
 def test_from_manifest_missing_corrupt_and_subset(runner, world, tmp_path):

@@ -15,9 +15,10 @@ class RunContext:
     mode: Mode
     run_id: str
     scan_types: list = field(default_factory=list)
+    inherit_types: bool = False     # no --scan-types: use each source scan's own engines
     config: tuple = ()
     t1: Any = None                 # TenantClient
-    t2: Any = None                 # Tenant2 (operations wrapper)
+    t2: Any = None                 # Target tenant (operations wrapper)
     t1_cfg: Any = None
     t2_cfg: Any = None
     state: Any = None

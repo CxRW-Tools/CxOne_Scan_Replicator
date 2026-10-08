@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""cxone-scan-replicator: re-scan Tenant1 source code in Tenant2 (zip upload), or download only."""
+"""cxone-scan-replicator: re-scan source-tenant code in the target tenant (zip upload), or download only."""
 from __future__ import annotations
 
 import argparse
@@ -28,22 +28,23 @@ from src.utils.ui import StatusUI, Stats
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="main.py", allow_abbrev=False,
-        description="Re-scan Tenant1 source in Tenant2 via zip upload, or download it only.")
+        description="Re-scan source-tenant code in the target tenant via zip upload, or download it only.")
     p.add_argument("--env-file", action="append", default=[], metavar="PATH",
                    help="dotenv file (repeatable; later files win). Without it ./.env is loaded if present.")
     p.add_argument("--source-env-file", metavar="PATH",
-                   help="Tenant1 (source) credentials: CXONE_BASE_URL, CXONE_TENANT, CXONE_API_KEY, "
+                   help="Source tenant credentials: CXONE_BASE_URL, CXONE_TENANT, CXONE_API_KEY, "
                         "[CXONE_IAM_URL], [CXONE_DEBUG]")
     p.add_argument("--target-env-file", metavar="PATH",
-                   help="Tenant2 (target) credentials, same variable names as the source file")
+                   help="Target tenant credentials, same variable names as the source file")
     src = p.add_argument_group("input")
     src.add_argument("--scan-ids", help="comma-separated scan IDs")
     src.add_argument("--scan-ids-file", metavar="PATH|-", help=".txt/.csv/.json file of scan IDs, or - for stdin")
     src.add_argument("--from-manifest", metavar="DIR", help="replicate from a download-only output directory")
-    p.add_argument("--scan-types", help="REQUIRED unless --download-only; any of: sast,iac,api,sca")
+    p.add_argument("--scan-types", help="engines to run in the target tenant: any of sast,iac,api,sca. Optional: when omitted, each scan "
+                        "runs the supported engines (sast/iac/api/sca) of its original scan")
 
     d = p.add_argument_group("download-only")
-    d.add_argument("--download-only", action="store_true", help="download Tenant1 source only; Tenant2 is never contacted")
+    d.add_argument("--download-only", action="store_true", help="download Source tenant source only; Target tenant is never contacted")
     d.add_argument("--output-dir", metavar="DIR")
     d.add_argument("--layout", choices=["flat", "by-project"], default="flat")
     d.add_argument("--no-save-zips", action="store_true", help="download, checksum and discard")
@@ -51,19 +52,20 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument("--min-free-gb", type=float, default=5.0)
     d.add_argument("--compact-manifest", action="store_true", help="rewrite the manifest with one row per scan")
 
-    for n in ("t1", "t2"):
-        g = p.add_argument_group(f"tenant {n[1]}")
-        g.add_argument(f"--{n}-base-url")
-        g.add_argument(f"--{n}-iam-url")
-        g.add_argument(f"--{n}-tenant")
-        g.add_argument(f"--{n}-api-key")
+    for n, role in (("t1", "source"), ("t2", "target")):
+        g = p.add_argument_group(f"{role} tenant")
+        for fld in ("base-url", "iam-url", "tenant", "api-key"):
+            # --t1-*/--t2-* kept as aliases of --source-*/--target-*
+            g.add_argument(f"--{role}-{fld}", f"--{n}-{fld}", dest=f"{n}_{fld.replace('-', '_')}")
 
     c = p.add_argument_group("concurrency / memory")
     c.add_argument("--download-workers", type=int, default=None)
     c.add_argument("--upload-workers", type=int, default=None)
     c.add_argument("--start-workers", type=int, default=2)
-    c.add_argument("--t1-max-concurrency", type=int, default=8)
-    c.add_argument("--t2-max-concurrency", type=int, default=8)
+    c.add_argument("--source-max-concurrency", "--t1-max-concurrency", dest="t1_max_concurrency",
+                   type=int, default=8)
+    c.add_argument("--target-max-concurrency", "--t2-max-concurrency", dest="t2_max_concurrency",
+                   type=int, default=8)
     c.add_argument("--metadata-batch", type=int, default=50)
     c.add_argument("--memory-zip-max-mb", type=int, default=256)
     c.add_argument("--memory-budget-mb", type=int, default=2048)
@@ -170,13 +172,14 @@ def _run(argv, session_factory, sleep) -> int:
         if args.scan_types:
             notices.append("--scan-types has no effect in --download-only mode")
         if any(getattr(args, f"t2_{f}", None) for f in ("base_url", "iam_url", "tenant", "api_key")):
-            notices.append("Tenant2 flags are ignored in --download-only mode")
+            notices.append("Target tenant flags are ignored in --download-only mode")
     if mode == Mode.FROM_MANIFEST and any(getattr(args, f"t1_{f}", None)
                                            for f in ("base_url", "iam_url", "tenant", "api_key")):
-        notices.append("Tenant1 flags are ignored in --from-manifest mode")
+        notices.append("Source tenant flags are ignored in --from-manifest mode")
 
     scan_types, config = [], ()
-    if mode.uses_t2:
+    inherit = mode.uses_t2 and args.scan_types is None      # no --scan-types: use each scan's original engines
+    if mode.uses_t2 and not inherit:
         scan_types = st.parse_scan_types(args.scan_types)       # exits 1 before any network call
         config = st.build_config(scan_types)
     args.download_workers = args.download_workers or (8 if mode == Mode.DOWNLOAD_ONLY else 4)
@@ -196,7 +199,7 @@ def _run(argv, session_factory, sleep) -> int:
     t2_cfg = resolve_tenant("T2", args, env, tgt_env) if mode.uses_t2 else None
     tenant_files = [e.files[0] for e in (src_env, tgt_env) if e]
     if mode == Mode.REPLICATE and same_tenant(t1_cfg, t2_cfg) and not args.allow_same_tenant:
-        raise FatalError("Tenant1 and Tenant2 resolve to the same tenant and base URL; "
+        raise FatalError("Source tenant and Target tenant resolve to the same tenant and base URL; "
                          "pass --allow-same-tenant if that is intended")
 
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:6]
@@ -210,7 +213,9 @@ def _run(argv, session_factory, sleep) -> int:
 
     # ---- preflight banner
     _say(args, f"Mode: {mode.value}")
-    if mode.uses_t2:
+    if inherit:
+        _say(args, "Scan types: per scan, from the original scan's engines (--scan-types not given)")
+    elif mode.uses_t2:
         _say(args, f"Scan types: {','.join(scan_types)} ({st.labels(scan_types)}) [source: {sources['scan_types']}]")
     all_files = env.files + tenant_files
     _say(args, "Env file(s): " + (", ".join(all_files) if all_files else "none"))
@@ -239,6 +244,7 @@ def _run(argv, session_factory, sleep) -> int:
         os.makedirs(os.path.dirname(os.path.abspath(args.state_db)), exist_ok=True)
     state = StateDB(args.state_db, readonly=args.dry_run)
     ctx = RunContext(args=args, mode=mode, run_id=run_id, scan_types=scan_types, config=config,
+                     inherit_types=inherit,
                      t1_cfg=t1_cfg, t2_cfg=t2_cfg, state=state, audit=audit, logger=logger, stats=stats,
                      out_dir=out_dir, dry_run=args.dry_run, paths=paths, sleep=sleep)
     pool = max(args.download_workers, args.upload_workers, args.start_workers, 8) + 4
@@ -254,9 +260,12 @@ def _run(argv, session_factory, sleep) -> int:
                           pool_size=pool, transfer_timeout=args.transfer_timeout,
                           session=mk("T2"), sleep=sleep)
         a2.ensure_authenticated()
-        if args.force_tenant_defaults and "sast" in scan_types:
-            ctx.config = st.build_config(scan_types, Tenant2(c2, ()).tenant_sast_defaults())
-        ctx.t2 = Tenant2(c2, ctx.config, sleep=sleep)
+        sast_value = None
+        if args.force_tenant_defaults and (inherit or "sast" in scan_types):
+            sast_value = Tenant2(c2, ()).tenant_sast_defaults()
+            if not inherit:
+                ctx.config = st.build_config(scan_types, sast_value)
+        ctx.t2 = Tenant2(c2, ctx.config, sleep=sleep, sast_value=sast_value)
 
     ids, subset = [], None
     if mode == Mode.FROM_MANIFEST:
@@ -274,7 +283,7 @@ def _run(argv, session_factory, sleep) -> int:
         if not ids:
             raise FatalError("no valid scan IDs supplied")
 
-    audit.event("run_start", mode=mode.value, scan_types=scan_types,
+    audit.event("run_start", mode=mode.value, scan_types=scan_types or "inherit-from-source",
                 scan_types_source=sources.get("scan_types"), env_files=all_files,
                 sources={c.label: c.sources for c in (t1_cfg, t2_cfg) if c},
                 tenants={"t1": t1_cfg.tenant if t1_cfg else None, "t2": t2_cfg.tenant if t2_cfg else None},
@@ -287,7 +296,8 @@ def _run(argv, session_factory, sleep) -> int:
     plan = preflight.build_plan(ctx, ids, subset)
     stats.total = len(plan.jobs)
     stats.header = {"tenants": " -> ".join(c.tenant for c in (t1_cfg, t2_cfg) if c),
-                    "scan_types": st.labels(scan_types) if scan_types else "",
+                    "scan_types": ("per scan (original engines)" if inherit
+                                   else st.labels(scan_types) if scan_types else ""),
                     "env_files": ", ".join(all_files)}
     stats.warnings = warnings
 
@@ -295,10 +305,10 @@ def _run(argv, session_factory, sleep) -> int:
         preflight.dry_run_checks(ctx, plan)
         if ctx.t2:
             try:
-                print(f"Tenant2 queue depth now: {ctx.t2.queue_depth(args.queue_count == 'running')} "
+                print(f"Target tenant queue depth now: {ctx.t2.queue_depth(args.queue_count == 'running')} "
                       f"(threshold {args.queue_max})")
             except Exception as e:  # informational only
-                print(f"Tenant2 queue depth unavailable: {type(e).__name__}")
+                print(f"Target tenant queue depth unavailable: {type(e).__name__}")
         print(preflight.format_plan(ctx, plan))
         return 0
 

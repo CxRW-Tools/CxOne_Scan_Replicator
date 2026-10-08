@@ -64,6 +64,7 @@ class E:
     START_FAILED = "start_failed"
     START_AMBIGUOUS = "start_ambiguous"
     SCAN_TYPE_REJECTED = "scan_type_rejected"
+    NO_SUPPORTED_ENGINES = "no_supported_engines"
     MANIFEST_ZIP_MISSING = "manifest_zip_missing"
     MANIFEST_ZIP_CORRUPT = "manifest_zip_corrupt"
     NOT_IN_MANIFEST = "not_in_manifest"

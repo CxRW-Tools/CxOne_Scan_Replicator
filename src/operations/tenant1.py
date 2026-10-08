@@ -1,4 +1,4 @@
-"""Tenant1 side: metadata, source availability and streamed download."""
+"""Source tenant side: metadata, source availability and streamed download."""
 from __future__ import annotations
 
 import contextlib
@@ -47,7 +47,7 @@ def fetch_metadata(client, ids: list, batch: int = 50, workers: int = 4) -> dict
         params = [("scan-ids", i) for i in chunk] + [("limit", len(chunk))]
         r = client.request("GET", "/api/scans", params=params)
         if r.status_code != 200:
-            raise FatalError(f"Tenant1 metadata request failed: HTTP {r.status_code} "
+            raise FatalError(f"Source tenant metadata request failed: HTTP {r.status_code} "
                              f"(needs view-scans permission)")
         return r.json().get("scans") or []
 
@@ -68,7 +68,7 @@ def head_source(client, scan_id: str):
         # availability probe is best-effort; the download surfaces real problems
         return None, None
     if r.status_code in (404, 410):
-        raise JobFailure(E.SOURCE_UNAVAILABLE, "source archive no longer available in Tenant1")
+        raise JobFailure(E.SOURCE_UNAVAILABLE, "source archive no longer available in Source tenant")
     if r.status_code in (401, 403):
         raise JobFailure(E.NO_SOURCE_PERMISSION, f"HTTP {r.status_code} on source availability check")
     length = None

@@ -1,4 +1,4 @@
-"""Tenant2 side: projects, upload, scan start, queue depth, de-dup index."""
+"""Target tenant side: projects, upload, scan start, queue depth, de-dup index."""
 from __future__ import annotations
 
 import json
@@ -48,9 +48,11 @@ def _id_from_response(r) -> str:
 
 
 class Tenant2:
-    def __init__(self, client, config: tuple, *, sleep=time.sleep):
+    def __init__(self, client, config: tuple, *, sleep=time.sleep, sast_value: Optional[dict] = None):
+        """config: fixed engine tuple for the whole run; empty => derive from each job's scan_types."""
         self.client = client
         self.config = config
+        self.sast_value = sast_value
         self.sleep = sleep
         self._proj_cache: dict = {}
         self._proj_locks: dict = {}
@@ -191,8 +193,9 @@ class Tenant2:
         handler = {"uploadUrl": upload_url}
         if job.branch:
             handler["branch"] = job.branch
+        config = self.config or st.build_config(job.scan_types, self.sast_value)
         return {"type": "upload", "handler": handler, "project": {"id": job.t2_project_id},
-                "config": st.config_payload(self.config), "tags": tags}
+                "config": st.config_payload(config), "tags": tags}
 
     def start_scan(self, body: dict) -> str:
         """POST /api/scans. Only 429 is retried inside the client; ambiguity is surfaced."""
@@ -211,7 +214,7 @@ class Tenant2:
         raise ScanStartRejected(r.status_code, r.text or "")
 
     def confirm_started(self, project_id: str, source_scan_id: str) -> Optional[str]:
-        """Is there already a Tenant2 scan tagged with this source scan id?"""
+        """Is there already a Target tenant scan tagged with this source scan id?"""
         r = self.client.request("GET", "/api/scans", params=[
             ("project-id", project_id), ("tags-keys", TAG_FROM_SCAN), ("tags-values", source_scan_id),
             ("sort", "-created_at"), ("limit", 5)])
@@ -252,13 +255,13 @@ class Tenant2:
         return total
 
     def dedupe_index(self, t1_tenants: Optional[set] = None) -> dict:
-        """{(t1_tenant, source_scan_id): (t2_scan_id, scan_types_tag)} from Tenant2 scan tags."""
+        """{(t1_tenant, source_scan_id): (t2_scan_id, scan_types_tag)} from Target tenant scan tags."""
         out, offset = {}, 0
         while True:
             r = self.client.request("GET", "/api/scans", params={
                 "tags-keys": TAG_FROM_SCAN, "limit": 500, "offset": offset})
             if r.status_code != 200:
-                raise FatalError(f"Tenant2 de-dup query failed: HTTP {r.status_code} (needs view-scans)")
+                raise FatalError(f"Target tenant de-dup query failed: HTTP {r.status_code} (needs view-scans)")
             rows = r.json().get("scans") or []
             for s in rows:
                 tags = s.get("tags") or {}

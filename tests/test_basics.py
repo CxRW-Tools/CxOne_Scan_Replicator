@@ -170,3 +170,15 @@ def test_sanitize_segments():
     assert sanitize_segment("проект-é") == "проект-é"
     assert zip_relpath("id", "a/b", "feat/x", "by-project").count("/") == 2
     assert zip_relpath("id", "p", "b", "flat") == "id.zip"
+
+
+def test_iam_url_derived_from_base_url_before_jwt():
+    class A:
+        t1_base_url = "https://ast.checkmarx.net"
+        t1_iam_url = t1_api_key = t1_tenant = None
+    A.t1_api_key = make_jwt("rw_demo", "deu.iam.checkmarx.net", "deu.ast.checkmarx.net")
+    cfg = resolve_tenant("T1", A, EnvSources(environ={}))
+    assert cfg.iam_url == "https://iam.checkmarx.net" and cfg.sources["iam_url"] == "derived-from-base-url"
+    assert cfg.tenant == "rw_demo" and cfg.base_url == "https://ast.checkmarx.net"
+    A.t1_iam_url = "https://custom.iam.example"
+    assert resolve_tenant("T1", A, EnvSources(environ={})).iam_url == "https://custom.iam.example"
