@@ -30,21 +30,33 @@ python -m pytest tests -q
 
 ### Env files
 
-Copy `.env.example` to e.g. `.env-prod`, fill in the API keys (`chmod 600`), then:
+Credentials live in **one file per tenant**, in the same format as the CxOne tool template
+(`.env.source.example`, `.env.target.example`):
 
-```bash
-python main.py --env-file .env-prod --scan-types sast,iac,api,sca --scan-ids-file ids.txt --dry-run
+```
+CXONE_BASE_URL=https://ast.checkmarx.net
+CXONE_TENANT=my-tenant
+CXONE_API_KEY=eyJ...
+CXONE_DEBUG=false
 ```
 
-* `--env-file` is repeatable; later files win for the same key. A missing/unreadable file is fatal (exit 1).
-* With no `--env-file`, `./.env` is loaded if present. With one, `./.env` is **not** loaded.
-* Files are read with `dotenv_values`; nothing is written into `os.environ`.
-* Only the API key is required per tenant. Tenant name, base URL and IAM URL are derived from the key's JWT
-  (`iss` claim, `ast-base-url` claim) unless set.
+```bash
+python main.py --source-env-file C:\envs\.env.rw_demo --target-env-file C:\envs\.env.cx_canary     --scan-types sast,sca --scan-ids-file scan-ids.txt --dry-run
+```
+
+* `--source-env-file` = Tenant1, `--target-env-file` = Tenant2. Download-only needs only the source file;
+  `--from-manifest` only the target file. The un-prefixed `CXONE_*` names are read **only** from these files
+  (never from the process environment), so the two tenants cannot be mixed up.
+* Only the API key is required; tenant, IAM URL and base URL are derived from its JWT when omitted.
+* Non-credential settings (`REPLICATOR_SCAN_TYPES`, `REPLICATOR_OUTPUT_DIR`, ...) go in an optional
+  `--env-file` (repeatable; later files win; `./.env` is loaded only if no `--env-file` is given), or on the CLI.
+  Legacy `CXONE_T1_*` / `CXONE_T2_*` variables in that file/environment still work at lower priority.
+* A missing/unreadable file is fatal (exit 1). Files are read with `dotenv_values`, never written to `os.environ`.
 
 | Value | Precedence (highest first) |
 |---|---|
-| every tenant field and option | CLI flag > `--env-file` (last file wins) > process environment > built-in default |
+| tenant field | CLI flag > that tenant's env file > legacy `CXONE_T1_*`/`CXONE_T2_*` (`--env-file`, environment) > JWT |
+| other option | CLI flag > `--env-file` (last file wins) > process environment > built-in default |
 | `--scan-types` | CLI > `REPLICATOR_SCAN_TYPES` in env file > process env. **No default.** |
 
 The preflight banner (stderr) prints the mode, scan types, env files and each tenant's resolved name/URLs with
@@ -82,8 +94,8 @@ even if this run selects different types. To re-scan with different types, use `
 ### Replicate
 
 ```bash
-python main.py --env-file .env-prod --scan-types sast,iac,api,sca --scan-ids-file ids.txt --dry-run
-python main.py --env-file .env-prod --scan-types sast,sca --scan-ids-file ids.txt --yes
+python main.py --source-env-file .env.source --target-env-file .env.target --scan-types sast,iac,api,sca --scan-ids-file ids.txt --dry-run
+python main.py --source-env-file .env.source --target-env-file .env.target --scan-types sast,sca --scan-ids-file ids.txt --yes
 ```
 
 Per scan: metadata (Tenant1) → source `HEAD` → download (memory up to `--memory-zip-max-mb`, otherwise a 0600
@@ -95,8 +107,8 @@ a time per project. Tags copied from the original scan plus:
 ### Download-only
 
 ```bash
-python main.py --env-file .env-t1 --download-only --output-dir ./src-export --scan-ids-file ids.txt
-python main.py --env-file .env-t1 --download-only --no-save-zips --scan-ids-file ids.txt   # verify availability only
+python main.py --source-env-file .env.source --download-only --output-dir ./src-export --scan-ids-file ids.txt
+python main.py --source-env-file .env.source --download-only --no-save-zips --scan-ids-file ids.txt   # verify availability only
 ```
 
 Tenant2 is never contacted; `--scan-types` is ignored (with a notice). Zips are written to `<name>.zip.part`,
@@ -109,7 +121,7 @@ The output dir is created `0700`; the zips contain customer source code (a warni
 ### From manifest
 
 ```bash
-python main.py --env-file .env-t2 --from-manifest ./src-export --scan-types iac,sca --yes
+python main.py --target-env-file .env.target --from-manifest ./src-export --scan-types iac,sca --yes
 ```
 
 Tenant1 is never contacted. Zips are verified against the manifest SHA-256 (`manifest_zip_missing` /
@@ -158,7 +170,8 @@ Second Ctrl-C: abort immediately (state stays resumable; leftover `.part` files 
 
 | Flag | Default | Notes |
 |---|---|---|
-| `--env-file PATH` | | repeatable |
+| `--source-env-file PATH` / `--target-env-file PATH` | | per-tenant credentials (template format) |
+| `--env-file PATH` | | optional settings; repeatable |
 | `--scan-ids IDS` / `--scan-ids-file PATH\|-` | | `.txt` (one per line, `#` comments), `.csv` (`scan_id`/`scanId` or first column), `.json`, `-` = stdin. UUIDs validated, de-duplicated |
 | `--from-manifest DIR` | | Tenant2-only mode |
 | `--scan-types` | required* | *not for `--download-only` |

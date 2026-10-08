@@ -357,3 +357,30 @@ def test_from_manifest_missing_corrupt_and_subset(runner, world, tmp_path):
     rc = runner.run("--from-manifest", str(out), "--scan-types", "sast", "--yes", "--scan-ids", ids[2],
                     "--ignore-duplicates", "--yes-ignore-duplicates")
     assert rc == 0 and len(world.t2_scans) == 1
+
+
+# ------------------------------------------------------------------ per-tenant env files (template format)
+def test_source_and_target_env_files(world, tmp_path):
+    import main as cli
+    from tests.fakes import T1_IAM, T2_IAM, make_jwt
+    src = tmp_path / ".env.source"
+    tgt = tmp_path / ".env.target"
+    src.write_text(f"CXONE_BASE_URL=https://{T1_HOST}\nCXONE_TENANT=tenant1\n"
+                   f"CXONE_API_KEY={make_jwt('tenant1', T1_IAM, T1_HOST)}\nCXONE_DEBUG=false\n")
+    tgt.write_text(f"CXONE_BASE_URL=https://{T2_HOST}\nCXONE_TENANT=tenant2\n"
+                   f"CXONE_API_KEY={make_jwt('tenant2', T2_IAM, T2_HOST)}\n")
+    a = world.add_scan()
+    base = ["--state-db", str(tmp_path / "s.sqlite"), "--log-dir", str(tmp_path / "logs"), "--no-ui",
+            "--quiet", "--yes", "--scan-ids", a, "--scan-types", "sast"]
+
+    def go(*extra):
+        return cli.main(["--source-env-file", str(src), "--target-env-file", str(tgt), *base, *extra],
+                        session_factory=lambda label: world, sleep=lambda s: None)
+    assert go() == 0 and len(world.t2_scans) == 1
+    # swapping them is impossible by accident: a missing file is fatal
+    assert cli.main(["--source-env-file", str(tmp_path / "nope"), "--target-env-file", str(tgt), *base],
+                    session_factory=lambda label: world, sleep=lambda s: None) == 1
+    # download-only needs only the source file
+    assert cli.main(["--source-env-file", str(src), "--download-only", "--no-save-zips", "--no-ui", "--quiet",
+                     "--state-db", str(tmp_path / "d.sqlite"), "--log-dir", str(tmp_path / "logs"),
+                     "--scan-ids", a], session_factory=lambda label: world, sleep=lambda s: None) == 0

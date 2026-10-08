@@ -149,15 +149,31 @@ class TenantConfig:
                 f"iam_url={self.iam_url} [{s.get('iam_url')}]  api_key=*** [{s.get('api_key')}]")
 
 
-def resolve_tenant(label: str, args, env: EnvSources) -> TenantConfig:
+def load_tenant_env(path: Optional[str]) -> Optional[EnvSources]:
+    """Load one tenant's own env file (template format: CXONE_BASE_URL, CXONE_TENANT, CXONE_API_KEY,
+    CXONE_IAM_URL, CXONE_DEBUG). The process environment is deliberately NOT consulted for these
+    un-prefixed names, so source and target can never be mixed up."""
+    if not path:
+        return None
+    return load_env_files([path], environ={})
+
+
+def resolve_tenant(label: str, args, env: EnvSources, tenant_env: Optional[EnvSources] = None) -> TenantConfig:
+    """Per field: CLI > this tenant's env file (CXONE_*) > legacy CXONE_T1_*/CXONE_T2_* in --env-file/env > JWT."""
     n = label.lower()
     cfg = TenantConfig(label=label)
+    role = "source" if label == "T1" else "target"
     for f in TENANT_FIELDS:
-        v, src = resolve_field(getattr(args, f"{n}_{f}", None), f"CXONE_{label}_{f.upper()}", env)
+        v, src = resolve_field(getattr(args, f"{n}_{f}", None), None, env)
+        if v is None and tenant_env is not None:
+            v, src = tenant_env.get(f"CXONE_{f.upper()}")
+        if v is None:
+            v, src = env.get(f"CXONE_{label}_{f.upper()}")
         setattr(cfg, f, v or "")
         cfg.sources[f] = src
     if not cfg.api_key:
-        raise FatalError(f"{label}: API key is required (--{n}-api-key or CXONE_{label}_API_KEY)")
+        raise FatalError(f"{label} ({role}): API key is required (--{role}-env-file with CXONE_API_KEY, "
+                         f"or --{n}-api-key)")
     claims = decode_jwt_payload(cfg.api_key)
     iss = claims.get("iss") or ""
     if not cfg.tenant and iss:

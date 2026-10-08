@@ -17,8 +17,8 @@ from src.operations.tenant2 import Tenant2
 from src.utils import scan_types as st
 from src.utils.audit import Audit, setup_logger
 from src.utils.auth import AuthError, AuthManager
-from src.utils.config import (apply_option_env, load_env_files, preparse_env_files, resolve_tenant,
-                              same_tenant)
+from src.utils.config import (apply_option_env, load_env_files, load_tenant_env, preparse_env_files,
+                              resolve_tenant, same_tenant)
 from src.utils.http import TenantClient
 from src.utils.manifest import ManifestWriter, compact_manifest
 from src.utils.state import StateDB
@@ -31,6 +31,11 @@ def build_parser() -> argparse.ArgumentParser:
         description="Re-scan Tenant1 source in Tenant2 via zip upload, or download it only.")
     p.add_argument("--env-file", action="append", default=[], metavar="PATH",
                    help="dotenv file (repeatable; later files win). Without it ./.env is loaded if present.")
+    p.add_argument("--source-env-file", metavar="PATH",
+                   help="Tenant1 (source) credentials: CXONE_BASE_URL, CXONE_TENANT, CXONE_API_KEY, "
+                        "[CXONE_IAM_URL], [CXONE_DEBUG]")
+    p.add_argument("--target-env-file", metavar="PATH",
+                   help="Tenant2 (target) credentials, same variable names as the source file")
     src = p.add_argument_group("input")
     src.add_argument("--scan-ids", help="comma-separated scan IDs")
     src.add_argument("--scan-ids-file", metavar="PATH|-", help=".txt/.csv/.json file of scan IDs, or - for stdin")
@@ -176,8 +181,20 @@ def _run(argv, session_factory, sleep) -> int:
         config = st.build_config(scan_types)
     args.download_workers = args.download_workers or (8 if mode == Mode.DOWNLOAD_ONLY else 4)
 
-    t1_cfg = resolve_tenant("T1", args, env) if mode.uses_t1 else None
-    t2_cfg = resolve_tenant("T2", args, env) if mode.uses_t2 else None
+    src_env = load_tenant_env(args.source_env_file) if mode.uses_t1 else None
+    tgt_env = load_tenant_env(args.target_env_file) if mode.uses_t2 else None
+    if mode == Mode.DOWNLOAD_ONLY and args.target_env_file:
+        notices.append("--target-env-file is ignored in --download-only mode")
+    if mode == Mode.FROM_MANIFEST and args.source_env_file:
+        notices.append("--source-env-file is ignored in --from-manifest mode")
+    for e in (src_env, tgt_env):
+        if e:
+            env.warnings.extend(e.warnings)
+            if str(e.get("CXONE_DEBUG")[0] or "").lower() == "true":
+                args.debug = True
+    t1_cfg = resolve_tenant("T1", args, env, src_env) if mode.uses_t1 else None
+    t2_cfg = resolve_tenant("T2", args, env, tgt_env) if mode.uses_t2 else None
+    tenant_files = [e.files[0] for e in (src_env, tgt_env) if e]
     if mode == Mode.REPLICATE and same_tenant(t1_cfg, t2_cfg) and not args.allow_same_tenant:
         raise FatalError("Tenant1 and Tenant2 resolve to the same tenant and base URL; "
                          "pass --allow-same-tenant if that is intended")
@@ -195,7 +212,8 @@ def _run(argv, session_factory, sleep) -> int:
     _say(args, f"Mode: {mode.value}")
     if mode.uses_t2:
         _say(args, f"Scan types: {','.join(scan_types)} ({st.labels(scan_types)}) [source: {sources['scan_types']}]")
-    _say(args, "Env file(s): " + (", ".join(env.files) if env.files else "none"))
+    all_files = env.files + tenant_files
+    _say(args, "Env file(s): " + (", ".join(all_files) if all_files else "none"))
     for cfg in (t1_cfg, t2_cfg):
         if cfg:
             _say(args, "  " + cfg.describe())
@@ -257,20 +275,20 @@ def _run(argv, session_factory, sleep) -> int:
             raise FatalError("no valid scan IDs supplied")
 
     audit.event("run_start", mode=mode.value, scan_types=scan_types,
-                scan_types_source=sources.get("scan_types"), env_files=env.files,
+                scan_types_source=sources.get("scan_types"), env_files=all_files,
                 sources={c.label: c.sources for c in (t1_cfg, t2_cfg) if c},
                 tenants={"t1": t1_cfg.tenant if t1_cfg else None, "t2": t2_cfg.tenant if t2_cfg else None},
                 dry_run=args.dry_run, version=VERSION)
     if not args.dry_run:
         safe_args = {k: v for k, v in vars(args).items() if "api_key" not in k}
-        state.start_run(run_id, mode.value, scan_types, safe_args, env.files,
+        state.start_run(run_id, mode.value, scan_types, safe_args, all_files,
                         t1_cfg.tenant if t1_cfg else "", t2_cfg.tenant if t2_cfg else "")
 
     plan = preflight.build_plan(ctx, ids, subset)
     stats.total = len(plan.jobs)
     stats.header = {"tenants": " -> ".join(c.tenant for c in (t1_cfg, t2_cfg) if c),
                     "scan_types": st.labels(scan_types) if scan_types else "",
-                    "env_files": ", ".join(env.files)}
+                    "env_files": ", ".join(all_files)}
     stats.warnings = warnings
 
     if args.dry_run:
